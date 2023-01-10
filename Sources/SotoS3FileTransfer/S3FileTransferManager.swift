@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+import Algorithms
 import Atomics
 import Foundation
 import Logging
@@ -390,7 +391,6 @@ public class S3FileTransferManager {
 
         return listFiles(in: folder).and(listFiles(in: s3Folder))
             .flatMap { files, s3Files in
-                let taskQueue = TaskQueue<Void>(maxConcurrentTasks: self.configuration.maxConcurrentTasks, on: eventLoop)
                 let folderResolved = URL(fileURLWithPath: folder).standardizedFileURL.resolvingSymlinksInPath()
                 let targetFiles = Self.targetFiles(files: files, from: folderResolved.path, to: s3Folder)
                 let transfers = targetFiles.compactMap { transfer -> (from: FileDescriptor, to: S3File)? in
@@ -401,15 +401,27 @@ public class S3FileTransferManager {
                     return nil
                 }
                 let folderProgress = FolderUploadProgress(transfers.map { $0.from }, progress: progress)
-                transfers.forEach { transfer in
-                    taskQueue.submitTask {
-                        self.copy(from: transfer.from.name, to: transfer.to, options: options) {
-                            try folderProgress.updateProgress(transfer.from.name, progress: $0)
-                        }.map { _ in
-                            folderProgress.setFileUploaded(transfer.from.name)
+
+                let nChunks = 4
+                let chunkSize = Int((Double(transfers.count) / Double(nChunks)).rounded(.up))
+                let taskQueues = (0..<nChunks).map { _ in
+                    TaskQueue<Void>(maxConcurrentTasks: self.configuration.maxConcurrentTasks, on: eventLoop)
+                }
+
+                for (index, chunk) in transfers.chunks(ofCount: chunkSize).enumerated() {
+                    chunk.forEach { transfer in
+                        taskQueues[index].submitTask {
+                            self.copy(from: transfer.from.name, to: transfer.to, options: options) {
+                                try folderProgress.updateProgress(transfer.from.name, progress: $0)
+                            }.map { _ in
+                                folderProgress.setFileUploaded(transfer.from.name)
+                            }
                         }
                     }
                 }
+
+                let taskQueue = TaskQueue<Void>(maxConcurrentTasks: self.configuration.maxConcurrentTasks, on: eventLoop)
+
                 // construct list of files to delete, if we are doing deletion
                 if delete == true {
                     let deletions = s3Files.compactMap { s3File -> S3File? in
@@ -421,9 +433,14 @@ public class S3FileTransferManager {
                     }
                     deletions.forEach { deletion in taskQueue.submitTask { self.delete(deletion) } }
                 }
-                return self.complete(taskQueue: taskQueue).map { _ in
-                    assert(folderProgress.finished == true)
-                }
+
+                let res = EventLoopFuture.whenAllSucceed(taskQueues.map { $0.andAllSucceed() }, on: eventLoop)
+                    .flatMap { _ in
+                        self.complete(taskQueue: taskQueue).map { _ in
+                            assert(folderProgress.finished == true)
+                        }
+                    }
+                return res
             }
     }
 
